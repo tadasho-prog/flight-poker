@@ -1,6 +1,6 @@
 // オフライン対応（要件 O-1）。初回に全ファイルを端末に保存し、以降は保存したものから表示する。
 // ファイルを更新したら CACHE の番号を上げること（古い保存は自動で消える）。
-const CACHE = 'flightpoker-v2';
+const CACHE = 'flightpoker-v3';
 const FILES = [
   './',
   'index.html',
@@ -12,27 +12,35 @@ const FILES = [
   'js/evaluator.js',
   'js/game.js',
   'js/help.js',
+  'js/preaction.js',
+  'js/seats.js',
+  'js/sizing.js',
   'icons/icon-180.png',
   'icons/icon-192.png',
   'icons/icon-512.png',
 ];
 
+// ブラウザの通常のキャッシュに残った古いファイルを拾わないよう、必ずサーバーから取り直す
+const fresh = () => FILES.map((f) => new Request(f, { cache: 'reload' }));
+
 self.addEventListener('install', (event) => {
-  event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(FILES)).then(() => self.skipWaiting()));
+  event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(fresh())).then(() => self.skipWaiting()));
 });
 
 self.addEventListener('activate', (event) => {
-  event.waitUntil(
-    caches.keys()
-      .then((keys) => Promise.all(keys.filter((k) => k.startsWith('flightpoker-') && k !== CACHE).map((k) => caches.delete(k))))
-      .then(() => self.clients.claim()),
-  );
+  event.waitUntil((async () => {
+    const old = (await caches.keys()).filter((k) => k.startsWith('flightpoker-') && k !== CACHE);
+    await Promise.all(old.map((k) => caches.delete(k)));
+    await self.clients.claim();
+    // 開いている画面の読み込み直しは画面側（app.js の controllerchange）で行う。
+    // ここから clients.navigate() すると画面が固まることがあったため使わない。
+  })());
 });
 
 // ページから「保存し直して」と頼まれたとき（保存が消えていた場合の保険）
 self.addEventListener('message', (event) => {
   if (event.data === 'recache') {
-    event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(FILES)).then(() => {
+    event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(fresh())).then(() => {
       event.source?.postMessage('recached');
     }));
   }

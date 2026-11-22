@@ -1,13 +1,17 @@
 // 画面と操作。ゲームの進行は game.js、CPU の判断は cpu.js。
 import {
-  createGame, createPlayer, startNewHand, applyAction, legalActions, toActPlayer, raiseToPotFraction,
-  pot, net, smallBlindIndex, bigBlindIndex, isValidState, BUY_IN_OPTIONS, STREET_NAMES, ACTION_NAMES,
+  createGame, createPlayer, startNewHand, applyAction, legalActions, toActPlayer,
+  pot, net, smallBlindIndex, bigBlindIndex, isValidState, BUY_IN_OPTIONS,
 } from './game.js';
 import { decideCPU, estimateEquity, CPU_LEVELS } from './cpu.js';
 import { rankSymbol, SUIT_SYMBOLS, isRed, sameCard } from './cards.js';
-import { evaluate } from './evaluator.js';
+import { evaluate, describeHand, handLabel, madeCards } from './evaluator.js';
+import { presets, defaultAmount, amountAt, positionOf, nudge, shortAmount, raiseNote } from './sizing.js';
+import { preActionOptions, makePreAction, isPreActionValid, resolvePreAction } from './preaction.js';
+import { seatLayout, STAGE, MY_SPOT } from './seats.js';
 import { renderHelp } from './help.js';
 
+const APP_VERSION = 'ver.3（2026-11-23 テーブル画面リニューアル）';
 const SAVE_KEY = 'flightpoker.save.v1';
 const SETUP_KEY = 'flightpoker.setup.v1';
 const ME = 'me';
@@ -30,9 +34,13 @@ let screen = 'title';       // title | setup | table | help
 let helpReturn = 'title';
 let setup = { buyIn: 100000, cpuCount: 5, cpuLevel: 'normal', showEquity: false, ...(store.get(SETUP_KEY) ?? {}) };
 let equityCache = { key: null, value: null };
-let raisePanel = { open: false, value: 0, seq: -1 };
+let sizing = { key: '', amount: 0 };   // 自分の番で選んでいるレイズ額
+let pre = null;                         // 先行予約（要件 U-15）
+const badgeSeen = {};                   // アクションバッジを出した時刻（一瞬大きく見せる演出用）
+let rebuyToast = { hand: 0, t: 0 };
 let modal = null;           // { text, ok, okLabel, cancelLabel }
 let botTimer = null;
+let botSeq = -1;           // botTimer がどの手番（actionSeq）のものか
 let offlineReady = null;    // null=確認中 / true / false
 
 const fmt = (n) => n.toLocaleString('ja-JP');
@@ -51,48 +59,6 @@ function save() {
   store.set(SAVE_KEY, { state, savedAt });
 }
 
-// ---- 部品 ----
-function cardHTML(card, cls = '', highlight = false) {
-  if (!card) return `<span class="card back ${cls}"></span>`;
-  return `<span class="card ${isRed(card) ? 'red' : ''} ${cls} ${highlight ? 'hl' : ''}"><b>${rankSymbol(card.r)}</b><i>${SUIT_SYMBOLS[card.s]}</i></span>`;
-}
-
-function badges(i) {
-  let html = '';
-  if (i === state.dealerIndex) html += ' <span class="badge d">D</span>';
-  if (state.phase !== 'notStarted' && i === smallBlindIndex(state)) html += ' <span class="badge">SB</span>';
-  if (state.phase !== 'notStarted' && i === bigBlindIndex(state)) html += ' <span class="badge">BB</span>';
-  return html;
-}
-
-function actionText(a) {
-  if (!a) return '';
-  if (a.kind === 'fold' || a.kind === 'check') return ACTION_NAMES[a.kind];
-  return `${ACTION_NAMES[a.kind]} ${fmt(a.amount)}`;
-}
-
-/** 勝者（メインポット）の役を作っている5枚 */
-function winningCards() {
-  const r = state.lastResult;
-  if (state.phase !== 'handComplete' || !r || !r.pots.length) return [];
-  const hand = r.showdown.find((h) => r.pots[0].winnerIds.includes(h.playerId));
-  return hand ? hand.value.bestFive : [];
-}
-const inList = (list, card) => list.some((c) => sameCard(c, card));
-
-/** 勝率の目安（要件 L-2）。街・残り人数が変わったときだけ計算し直す */
-function equityText() {
-  const s = state;
-  const me = s.players.find((p) => p.id === ME);
-  if (!s.settings.showEquity || s.phase !== 'betting' || me.folded) return '';
-  const opponents = s.players.filter((p) => p.id !== ME && !p.folded).length;
-  const key = `${s.handNumber}:${s.board.length}:${opponents}`;
-  if (equityCache.key !== key) {
-    equityCache = { key, value: estimateEquity(me.holeCards, s.board, opponents, 1500) };
-  }
-  return `<span class="dim">${s.board.length >= 3 ? '　' : ''}勝率 約${Math.round(equityCache.value * 100)}%</span>`;
-}
-
 // ---- 画面 ----
 function render() {
   let html = '';
@@ -106,8 +72,11 @@ function render() {
       <button class="btn orange" data-act="modal-ok">${modal.okLabel}</button></div></div></div>`;
   }
   app.innerHTML = html;
-  app.classList.toggle('has-result', screen === 'table' && state?.phase === 'handComplete');
-  if (screen === 'table') scheduleBot();
+  app.className = `screen-${screen}`;
+  if (screen === 'table') {
+    fitStage();
+    scheduleBot();
+  }
 }
 
 function renderTitle() {
@@ -133,7 +102,7 @@ function renderTitle() {
         <button class="btn gray" data-act="help">遊び方・役の強さ</button>
       </div>
     </div>
-    <div class="title-foot">${offline}</div>`;
+    <div class="title-foot">${offline}<br><span class="faint">${APP_VERSION}</span></div>`;
 }
 
 function renderSetup() {
@@ -165,146 +134,326 @@ function renderSetup() {
     </div>`;
 }
 
+// ===== テーブル画面（Claude Design「機内ポーカー テーブル画面 改善案」どおり。要件 U-8〜U-17） =====
+
+const STREET_PILL = { preflop: 'プリフロップ', flop: 'フロップ', turn: 'ターン', river: 'リバー', showdown: 'ショーダウン' };
+
+/** トランプ1枚（幅 w px）。card が null なら裏 */
+function pcard(card, w, hl = false, dim = false) {
+  const h = Math.round(w * 1.4);
+  if (!card) return `<span class="pc back" style="width:${w}px;height:${h}px"></span>`;
+  const red = isRed(card);
+  return `<span class="pc${hl ? ' hl' : ''}${dim ? ' dim' : ''}" style="width:${w}px;height:${h}px;font-size:${Math.round(w * 0.4)}px;color:${red ? '#c8102e' : '#111'}"><span>${rankSymbol(card.r)}</span><span>${SUIT_SYMBOLS[card.s]}</span></span>`;
+}
+
+function posBadges(i) {
+  let html = '';
+  if (i === state.dealerIndex) html += '<span class="d-btn">D</span>';
+  if (i === smallBlindIndex(state)) html += '<span class="blind">SB</span>';
+  else if (i === bigBlindIndex(state)) html += '<span class="blind">BB</span>';
+  return html;
+}
+
+/** 新しく動いた瞬間だけバッジを大きく見せる（描き直してもアニメーションが最初に戻らないよう、経過時間を引き継ぐ） */
+function popAttr(id, key, duration = 650) {
+  const seen = badgeSeen[id];
+  if (!seen || seen.key !== key) badgeSeen[id] = { key, t: Date.now() };
+  const elapsed = Date.now() - badgeSeen[id].t;
+  return elapsed < duration ? ` pop" style="animation-delay:-${elapsed}ms` : '';
+}
+
+function actionBadge(p, i) {
+  const s = state;
+  if (s.phase !== 'betting') return null;
+  if (i === s.toActIndex) return { cls: 'think', text: '考え中' };
+  const a = p.lastAction;
+  if (!a || p.folded) return null;
+  const map = {
+    check: ['check', 'チェック'], call: ['call', 'コール'], bet: ['raise', `ベット ${fmt(a.amount)}`],
+    raise: ['raise', `レイズ ${fmt(a.amount)}`], allIn: ['allin', `オールイン ${fmt(a.amount)}`],
+  };
+  if (!map[a.kind]) return null; // SB/BB はチップの表示だけ
+  return { cls: map[a.kind][0], text: map[a.kind][1], key: `${s.handNumber}:${s.street}:${a.kind}:${a.amount}` };
+}
+
+/** 自分の番まであと何人（要件 U-17）。自分がもう動かなくてよい場合は 0 */
+function turnsUntilMe(meIndex) {
+  const s = state;
+  const me = s.players[meIndex];
+  if (s.phase !== 'betting' || s.toActIndex === null || me.folded || me.allIn) return 0;
+  if (me.actedThisStreet && me.streetBet >= s.currentBet) return 0;
+  let n = 0;
+  for (let i = s.toActIndex, guard = 0; i !== meIndex && guard < s.players.length; i = (i + 1) % s.players.length, guard++) {
+    const p = s.players[i];
+    if (!p.folded && !p.allIn) n++;
+  }
+  return n;
+}
+
+function myToCall(me) {
+  return Math.min(Math.max(0, state.currentBet - me.streetBet), me.stack);
+}
+
 function renderTable() {
   const s = state;
+  const n = s.players.length;
   const meIndex = s.players.findIndex((p) => p.id === ME);
   const me = s.players[meIndex];
-  const hl = winningCards();
-  const revealed = new Set((s.phase === 'handComplete' && s.lastResult) ? s.lastResult.showdown.map((h) => h.playerId) : []);
+  const result = s.phase === 'handComplete' ? s.lastResult : null;
+  const shown = new Map(result ? result.showdown.map((h) => [h.playerId, h]) : []);
+  const mainWinners = result ? result.pots[0]?.winnerIds ?? [] : [];
 
-  // 相手：自分の次の席から時計回り
-  const n = s.players.length;
+  // 強調するカード：結果では勝者の役、プレイ中は自分の役
+  let hl = [];
+  if (result && result.showdown.length) {
+    const w = result.showdown.find((h) => mainWinners.includes(h.playerId));
+    if (w) hl = madeCards(w.value);
+  } else if (!result && !me.folded && s.board.length >= 3) {
+    hl = madeCards(evaluate([...me.holeCards, ...s.board]));
+  }
+  const isHl = (c) => hl.some((h) => sameCard(h, c));
+
+  // ---- 席 ----
   const others = Array.from({ length: n - 1 }, (_, k) => (meIndex + 1 + k) % n);
-  const compact = others.length > 6;
-  const seats = others.map((i) => {
+  const layout = seatLayout(others.length);
+  const seats = others.map((i, k) => {
     const p = s.players[i];
-    const toAct = i === s.toActIndex;
-    let cards = '';
-    if (revealed.has(p.id)) cards = p.holeCards.map((c) => cardHTML(c, 'w-sm', inList(hl, c))).join('');
-    else if (p.holeCards.length && !p.folded) cards = cardHTML(null, compact ? 'w-xs' : 'w-sm') + cardHTML(null, compact ? 'w-xs' : 'w-sm');
-    const act = toAct ? '<div class="act thinking">考え中…</div>' : `<div class="act">${actionText(p.lastAction)}</div>`;
-    return `<div class="seat ${toAct ? 'to-act' : ''} ${p.folded && s.phase === 'betting' ? 'folded' : ''}">
-      <div class="nm">${p.name}${badges(i)}</div><div class="cards">${cards}</div>
-      <div class="stk num">${fmt(p.stack)}</div>${act}</div>`;
+    const L = layout[k];
+    const showHand = shown.get(p.id);
+    const won = result && (result.totalPayouts[p.id] ?? 0) > 0;
+    let cardsHtml;
+    if (showHand) cardsHtml = `<div class="s-cards up">${showHand.holeCards.map((c) => pcard(c, 18, isHl(c))).join('')}</div>`;
+    else if (p.folded) cardsHtml = '<div class="s-cards fold">フォールド</div>';
+    else if (p.holeCards.length) cardsHtml = `<div class="s-cards">${pcard(null, 15)}${pcard(null, 15)}</div>`;
+    else cardsHtml = '<div class="s-cards"></div>';
+
+    let badge = '';
+    if (showHand) {
+      badge = `<div class="s-badge ${won ? 'win' : 'hand'}">${showHand.value.name}</div>`;
+    } else {
+      const b = actionBadge(p, i);
+      if (b) badge = `<div class="s-badge ${b.cls}${b.key ? popAttr(p.id, b.key) : ''}">${b.text}</div>`;
+    }
+
+    let chip = '';
+    if (!result && p.streetBet > 0) chip = `<div class="chip" style="left:${L.bx}px;top:${L.by}px"><i></i>${fmt(p.streetBet)}</div>`;
+    else if (won) chip = `<div class="chip gain" style="left:${L.bx}px;top:${L.by}px"><i></i>+${fmt(result.totalPayouts[p.id])}</div>`;
+
+    const hot = !result && i === s.toActIndex;
+    return `<div class="seat${hot ? ' hot' : ''}${won ? ' win' : ''}${p.folded ? ' folded' : ''}${showHand ? ' shown' : ''}" style="left:${L.x - 37}px;top:${L.y - (showHand ? 32 : 30)}px">
+        <div class="s-name"><span>${p.name}</span>${posBadges(i)}</div>${cardsHtml}
+        <div class="s-stack">${fmt(p.stack)}</div>${badge}</div>${chip}`;
   }).join('');
 
-  const board = Array.from({ length: 5 }, (_, k) =>
-    k < s.board.length ? cardHTML(s.board[k], 'w-lg', inList(hl, s.board[k])) : '<span class="slot w-lg"></span>').join('');
+  // ---- 中央 ----
+  const board = Array.from({ length: 5 }, (_, k) => (k < s.board.length ? pcard(s.board[k], 40, isHl(s.board[k])) : '<span class="slot"></span>')).join('');
+  const meToAct = !result && s.toActIndex === meIndex;
+  let pillText = 'あなた';
+  let pillCls = '';
+  if (meToAct) { pillText = 'あなたの番'; pillCls = ' on'; }
+  else if (result && shown.get(ME)) pillText = `あなた ${shown.get(ME).value.name}`;
+  else if (!result && me.folded) pillText = 'あなた（フォールド）';
+  else if (!result && me.allIn) pillText = 'あなた（オールイン）';
+  const myWon = result && (result.totalPayouts[ME] ?? 0) > 0;
+  let myChip = '';
+  if (!result && me.streetBet > 0) myChip = `<div class="chip" style="left:${MY_SPOT.chip[0]}px;top:${MY_SPOT.chip[1]}px"><i></i>${fmt(me.streetBet)}</div>`;
+  else if (myWon) myChip = `<div class="chip gain" style="left:${MY_SPOT.chip[0]}px;top:${MY_SPOT.chip[1]}px"><i></i>+${fmt(result.totalPayouts[ME])}</div>`;
 
-  let banner = '';
+  // 買い足しのお知らせ（ハンドの最初に数秒だけ）
+  let toast = '';
   if (s.phase === 'betting' && s.rebuyIds.length) {
-    const names = s.rebuyIds.map((id) => s.players.find((p) => p.id === id)?.name).join('、');
-    banner = `<div class="banner">${names} が ${fmt(s.settings.buyIn)} を買い足しました</div>`;
+    if (rebuyToast.hand !== s.handNumber) rebuyToast = { hand: s.handNumber, t: Date.now() };
+    const elapsed = Date.now() - rebuyToast.t;
+    if (elapsed < 3600) {
+      const names = s.rebuyIds.map((id) => s.players.find((p) => p.id === id)?.name).join('・');
+      toast = `<div class="toast" style="animation-delay:-${elapsed}ms">${names} が買い足しました</div>`;
+    }
   }
 
-  let myHand = '';
-  if (me.folded) myHand = '<span class="faint">フォールド</span>';
-  else if (s.board.length >= 3) myHand = `<span class="gold"><b>${evaluate([...me.holeCards, ...s.board]).name}</b></span>`;
-
-  const meToAct = s.toActIndex === meIndex;
-  return `<div class="table-head">
-      <span class="hand">ハンド #${s.handNumber}</span>
-      <span class="blinds num">SB/BB ${fmt(s.settings.smallBlind)}/${fmt(s.settings.bigBlind)}</span>
-      <button class="icon-btn" data-act="help" aria-label="遊び方">?</button>
-      <button class="icon-btn" data-act="menu" aria-label="中断">✕</button>
-    </div>
-    ${banner}
-    <div class="seats ${compact ? 'compact' : ''}">${seats}</div>
-    <div class="center">
+  const stage = `<div class="stage">
+      <div class="felt"></div>
+      <div class="pot"><span>ポット</span>${fmt(pot(s))}</div>
       <div class="board">${board}</div>
-      <div class="pot-line"><span class="street">${STREET_NAMES[s.street]}</span><span class="pot num">ポット ${fmt(pot(s))}</span></div>
+      <div class="street"><span>${STREET_PILL[s.street]}</span></div>
+      ${seats}
+      ${myChip}
+      <div class="me-pill${pillCls}" style="left:${MY_SPOT.pill[0]}px;top:${MY_SPOT.pill[1]}px">${pillText}${posBadges(meIndex)}</div>
+      ${toast}
+    </div>`;
+
+  return `<div class="t-head">
+      <b>ハンド #${s.handNumber}</b>
+      <span class="blinds">SB/BB ${fmt(s.settings.smallBlind)} / ${fmt(s.settings.bigBlind)}</span>
+      <span class="grow"></span>
+      <button class="round" data-act="help" aria-label="遊び方・役の強さ">?</button>
+      <button class="round" data-act="menu" aria-label="中断"><svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 3l10 10M13 3L3 13"></path></svg></button>
     </div>
-    <div class="me ${meToAct ? 'to-act' : ''}">
-      <div class="my-cards">${me.holeCards.map((c) => cardHTML(c, `w-xl ${me.folded ? 'dimmed' : ''}`, inList(hl, c))).join('')}</div>
-      <div class="info">
-        <div class="nm">${me.name}${badges(meIndex)}</div>
-        <div class="stk num">${fmt(me.stack)}</div>
-        <div class="sub num ${net(me) >= 0 ? 'plus' : 'minus'}">収支 ${signed(net(me))}</div>
-        <div class="sub">${myHand}${equityText()}</div>
-      </div>
-      ${me.streetBet > 0 && s.phase === 'betting' ? `<div class="bet num"><small>ベット</small>${fmt(me.streetBet)}</div>` : ''}
-    </div>
-    ${renderBottom(meToAct)}`;
+    <div class="table-area">${stage}</div>
+    ${renderHero(me, meToAct, result, shown, isHl)}
+    <div class="actions">${renderActions(me, meIndex, meToAct, result, shown)}</div>`;
 }
 
-function renderBottom(meToAct) {
+function renderHero(me, meToAct, result, shown, isHl) {
   const s = state;
-  if (s.phase === 'handComplete' && s.lastResult) return renderResult();
-  if (s.phase !== 'betting' || s.toActIndex === null) {
-    // 念のため：進行が止まって見える状態にしない
-    return '<button class="btn gold" data-act="next" style="flex:none">次のハンドへ</button>';
+  const cards = me.holeCards.map((c) => pcard(c, 50, isHl(c), me.folded && !result)).join('');
+  const nv = net(me);
+  const netText = nv === 0 ? '収支 ±0' : nv > 0 ? `収支 +${fmt(nv)}` : `収支 −${fmt(-nv)}`;
+  let right = '';
+  if (result) {
+    const h = shown.get(ME);
+    if (h) right = `<div class="big">${h.value.name}</div><div class="small">${describeHand(h.value)}</div>`;
+  } else if (me.folded) {
+    right = '<div class="small">フォールド</div>';
+  } else if (s.board.length >= 3) {
+    const v = evaluate([...me.holeCards, ...s.board]);
+    const sub = s.settings.showEquity ? `勝率の目安 約${equityPercent(me)}%` : describeHand(v);
+    right = `<div class="big gold">${v.name}</div><div class="small">${sub}</div>`;
+  } else if (s.settings.showEquity) {
+    right = `<div class="small">勝率の目安</div><div class="big gold">約${equityPercent(me)}%</div>`;
   }
-  if (!meToAct) return `<div class="waiting">${toActPlayer(s).name} の番です</div>`;
-
-  const legal = legalActions(s, ME);
-  if (raisePanel.open && raisePanel.seq === s.actionSeq && legal.canRaise) return renderRaisePanel(legal);
-
-  const me = s.players.find((p) => p.id === ME);
-  let buttons = '';
-  if (legal.canFold) buttons += '<button class="btn gray" data-act="fold">フォールド</button>';
-  if (legal.canCheck) buttons += '<button class="btn blue" data-act="check">チェック</button>';
-  else if (legal.callAmount > 0) {
-    const allIn = legal.callAmount >= me.stack;
-    buttons += `<button class="btn blue" data-act="call">${allIn ? 'オールイン' : 'コール'}<small class="num">${fmt(legal.callAmount)}</small></button>`;
-  }
-  if (legal.canRaise) buttons += `<button class="btn orange" data-act="open-raise">${legal.isBet ? 'ベット' : 'レイズ'}</button>`;
-  return `<div class="row">${buttons}</div>`;
-}
-
-function clampRaise(value, legal) {
-  if (value >= legal.maxRaiseTo - 999) return legal.maxRaiseTo; // 右端はオールイン
-  return Math.min(Math.max(Math.round(value), legal.minRaiseTo), legal.maxRaiseTo);
-}
-
-function renderRaisePanel(legal) {
-  const amount = clampRaise(raisePanel.value, legal);
-  const half = raiseToPotFraction(state, ME, 0.5);
-  const full = raiseToPotFraction(state, ME, 1);
-  const label = legal.isBet ? 'ベット' : 'レイズ';
-  const amountText = amount === legal.maxRaiseTo ? `${fmt(amount)}（オールイン）` : fmt(amount);
-  const slider = legal.maxRaiseTo > legal.minRaiseTo
-    ? `<input type="range" id="raise-range" min="${legal.minRaiseTo}" max="${legal.maxRaiseTo}" step="1000" value="${amount}" aria-label="${label}額">`
-    : '';
-  return `<div class="raise-panel">
-      <div class="amount-row"><span class="dim" style="font-size:12px">${legal.isBet ? 'ベット額' : 'レイズ後の額'}</span>
-        <span class="amount num" id="raise-amount">${amountText}</span></div>
-      ${slider}
-      <div class="chips-row">
-        <button data-act="raise-preset" data-v="${legal.minRaiseTo}">最小</button>
-        ${half !== null ? `<button data-act="raise-preset" data-v="${half}">1/2ポット</button>` : ''}
-        ${full !== null ? `<button data-act="raise-preset" data-v="${full}">ポット</button>` : ''}
-        <button data-act="raise-preset" data-v="${legal.maxRaiseTo}">オールイン</button>
-      </div>
-      <div class="row">
-        <button class="btn gray" data-act="close-raise">戻る</button>
-        <button class="btn orange" data-act="do-raise">${label}<small class="num" id="raise-confirm">${fmt(amount)}</small></button>
-      </div>
+  return `<div class="hero${meToAct ? ' on' : ''}">
+      <div class="h-cards">${cards}</div>
+      <div class="h-info"><div class="h-name">あなた</div><div class="h-stack">${fmt(me.stack)}</div>
+        <div class="h-net ${nv >= 0 ? 'plus' : 'minus'}">${netText}</div></div>
+      <div class="h-right">${right}</div>
     </div>`;
 }
 
-function renderResult() {
+/** 勝率の目安（要件 L-2）。街・残り人数が変わったときだけ計算し直す */
+function equityPercent(me) {
   const s = state;
-  const r = s.lastResult;
-  const nameOf = (id) => s.players.find((p) => p.id === id)?.name ?? '?';
-  const went = r.showdown.length > 0;
-  const pots = r.pots.map((p, i) => {
-    const label = r.pots.length === 1 ? 'ポット' : i === 0 ? 'メインポット' : `サイドポット${i}`;
-    if (!went) return `<div class="pot-res"><div class="win">全員フォールド → ${nameOf(p.winnerIds[0])} の勝ち（+${fmt(p.amount)}）</div></div>`;
-    if (p.eligibleIds.length === 1) return `<div class="pot-res"><div class="ret">${label}：${nameOf(p.eligibleIds[0])} に ${fmt(p.amount)} を返却（コールされなかった分）</div></div>`;
-    const winners = p.winnerIds.map(nameOf).join('・');
-    return `<div class="pot-res"><div class="label num">${label} ${fmt(p.amount)}</div>
-      <div class="win">${winners} ${p.winnerIds.length > 1 ? 'で分け合い' : 'の勝ち'}（${p.winningHandName}）</div></div>`;
+  const opponents = s.players.filter((p) => p.id !== ME && !p.folded).length;
+  const key = `${s.handNumber}:${s.board.length}:${opponents}`;
+  if (equityCache.key !== key) equityCache = { key, value: estimateEquity(me.holeCards, s.board, opponents, 1500) };
+  return Math.round(equityCache.value * 100);
+}
+
+// ---- 操作エリア（高さ固定：要件 U-13） ----
+function renderActions(me, meIndex, meToAct, result, shown) {
+  if (result) return renderResultActions(me, result, shown);
+  if (state.phase !== 'betting' || state.toActIndex === null) {
+    return '<div class="grow"></div><button class="btn-main next" data-act="next">次のハンドへ</button>';
+  }
+  if (meToAct) return renderMyTurn(me);
+  return renderWaiting(me, meIndex);
+}
+
+function currentSizing(list, legal) {
+  const key = `${state.handNumber}:${state.actionSeq}`;
+  if (sizing.key !== key) sizing = { key, amount: defaultAmount(state, list) };
+  sizing.amount = Math.min(Math.max(sizing.amount, legal.minRaiseTo), legal.maxRaiseTo);
+  return sizing.amount;
+}
+
+function raiseTexts(legal, amount) {
+  const label = amount >= legal.maxRaiseTo ? 'オールイン' : legal.isBet ? 'ベット' : 'レイズ';
+  const note = raiseNote(state, amount);
+  return { label, sub: `${fmt(amount)}${note ? `（${note}）` : ''}` };
+}
+
+function renderMyTurn(me) {
+  const legal = legalActions(state, ME);
+  const list = presets(state, ME);
+  const canRaise = !!list;
+  let presetsHtml;
+  let sliderHtml;
+  let amount = 0;
+  if (canRaise) {
+    amount = currentSizing(list, legal);
+    const lo = legal.minRaiseTo;
+    const hi = legal.maxRaiseTo;
+    const t = positionOf(amount, lo, hi);
+    const pct = (t * 100).toFixed(1);
+    const onIndex = list.findIndex((p) => p.amount === amount); // 同じ額が並んでも枠は1つだけ
+    presetsHtml = list.map((p, k) => `<button class="preset${k === onIndex ? ' on' : ''}" data-act="preset" data-v="${p.amount}"><b>${p.label}</b><span>${fmt(p.amount)}</span></button>`).join('');
+    const ticks = list.map((p) => `<i class="tick" style="left:${(positionOf(p.amount, lo, hi) * 100).toFixed(1)}%"></i>`).join('');
+    const scale = [0, 0.25, 0.5, 0.75, 1].map((q) => `<span class="mark" style="left:${q * 100}%;transform:translateX(${q === 0 ? '0' : q === 1 ? '-100%' : '-50%'})">${shortAmount(amountAt(q, lo, hi))}</span>`).join('');
+    sliderHtml = `<button class="nudge" data-act="nudge" data-v="-1" aria-label="少し下げる">−</button>
+      <div class="slider" data-lo="${lo}" data-hi="${hi}">
+        <div class="track"></div><div class="fill" style="width:${pct}%"></div>${ticks}
+        <div class="thumb" style="left:calc(${pct}% - 12px)"></div>
+        <input type="range" id="raise-range" min="0" max="1000" step="1" value="${Math.round(t * 1000)}" aria-label="レイズ額" ${hi > lo ? '' : 'disabled'}>
+        ${scale}
+      </div>
+      <button class="nudge" data-act="nudge" data-v="1" aria-label="少し上げる">＋</button>`;
+  } else {
+    presetsHtml = ['', '', '', ''].map(() => '<button class="preset" disabled><b>—</b><span>&nbsp;</span></button>').join('');
+    sliderHtml = '<div class="slider-off">これ以上レイズはできません</div>';
+  }
+
+  let buttons = '';
+  if (legal.canCheck) buttons += '<button class="btn-main check" data-act="check" style="flex:1 1 0">チェック</button>';
+  else {
+    buttons += '<button class="btn-main fold" data-act="fold" style="flex:1 1 0">フォールド</button>';
+    const allIn = legal.callAmount >= me.stack;
+    buttons += `<button class="btn-main call" data-act="call" style="flex:1.1 1 0"><b>${allIn ? 'オールイン' : 'コール'}</b><span>${fmt(legal.callAmount)}</span></button>`;
+  }
+  if (canRaise) {
+    const r = raiseTexts(legal, amount);
+    buttons += `<button class="btn-main raise" data-act="do-raise" style="flex:1.4 1 0"><b id="raise-label">${r.label}</b><span id="raise-sub">${r.sub}</span></button>`;
+  }
+  return `<div class="presets${canRaise ? '' : ' off'}">${presetsHtml}</div>
+    <div class="slider-row${canRaise ? '' : ' off'}">${sliderHtml}</div>
+    <div class="main-row">${buttons}</div>`;
+}
+
+function renderWaiting(me, meIndex) {
+  const s = state;
+  const p = toActPlayer(s);
+  const left = turnsUntilMe(meIndex);
+  const head = `<div class="w-head"><div><i class="dot"></i>${p.name} が考え中…</div>${left > 0 ? `<div class="w-left">あなたの番まで あと${left}人</div>` : ''}</div>`;
+  if (me.folded) return `${head}<div class="w-msg">フォールドしました。次のハンドを待っています</div>`;
+  if (me.allIn) return `${head}<div class="w-msg">オールインしています。結果を待っています</div>`;
+
+  const toCall = myToCall(me);
+  const ctx = { handNumber: s.handNumber, street: s.street, toCall };
+  if (pre && !isPreActionValid(pre, ctx)) pre = null; // レイズ・ベットが入ったら取り消す
+  const opts = preActionOptions(toCall);
+  const buttons = opts.map((o) => {
+    const on = pre && pre.type === o.type;
+    const label = o.type === 'call' ? `${o.label} ${fmt(o.amount)}` : o.label;
+    return `<button class="pre${on ? ' on' : ''}" data-act="pre" data-v="${o.type}" aria-pressed="${on ? 'true' : 'false'}"><span class="pbox"><svg aria-hidden="true" width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="#1a1205" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 6.2l2.4 2.4 4.6-5"></path></svg></span>${label}</button>`;
   }).join('');
-  const rows = went ? '<hr class="sep">' + r.showdown.map((h) => {
-    const won = r.totalPayouts[h.playerId] ?? 0;
-    return `<div class="sd-row ${won > 0 ? 'won' : ''}">
-      <div class="who"><b>${nameOf(h.playerId)}</b><span class="${won > 0 ? 'gold' : 'dim'}">${h.value.name}</span>${won > 0 ? `<br><span class="plus num">+${fmt(won)}</span>` : ''}</div>
-      <div class="hole">${h.holeCards.map((c) => cardHTML(c, 'w-md', inList(h.value.bestFive, c))).join('')}</div>
-      <span class="arrow">→</span>
-      <div class="five">${h.value.bestFive.map((c) => cardHTML(c, 'w-sm')).join('')}</div></div>`;
-  }).join('') : '';
-  return `<div class="result"><div class="scroll">${pots}${rows}</div>
-    <button class="btn gold" data-act="next" style="flex:none">次のハンドへ</button></div>`;
+  const note = toCall > 0 ? '誰かがレイズしたら、コールの予約は取り消されます' : '誰かがベットしたら、チェックの予約は取り消されます';
+  return `${head}<div class="w-cap">先に選んでおく（自分の番になったら自動で実行）</div>
+    <div class="main-row">${buttons}</div><div class="w-note">${note}</div>`;
+}
+
+function renderResultActions(me, result, shown) {
+  const s = state;
+  const nameOf = (id) => (id === ME ? 'あなた' : s.players.find((p) => p.id === id)?.name ?? '?');
+  const main = result.pots[0];
+  const winners = main.winnerIds;
+  const went = result.showdown.length > 0;
+  const title = winners.length > 1 ? `${winners.map(nameOf).join('・')} で分け合い` : `${nameOf(winners[0])} の勝ち`;
+  const wv = went ? shown.get(winners[0])?.value : null;
+  const sub = went && wv ? handLabel(wv) : '全員フォールド';
+  const amount = main.payouts[winners[0]] ?? main.amount; // メインポットの取り分（サイドポットは下に内訳）
+
+  const notes = [];
+  result.pots.forEach((p, i) => {
+    if (i === 0) return;
+    if (p.eligibleIds.length === 1) notes.push(`${nameOf(p.eligibleIds[0])} に ${fmt(p.amount)} を返却（コールされなかった分）`);
+    else notes.push(`サイドポット${i}（${fmt(p.amount)}）：${p.winnerIds.map(nameOf).join('・')}（${p.winningHandName}）`);
+  });
+  if (me.stack === 0) notes.push(`チップがなくなったので、次のハンドで ${fmt(s.settings.buyIn)} を買い足します`);
+  const bustCPUs = s.players.filter((p) => p.isCPU && p.stack === 0).map((p) => p.name);
+  if (bustCPUs.length) notes.push(`次のハンドで買い足し：${bustCPUs.join('・')}`);
+
+  return `<div class="win-box"><div><div class="w-title">${title}</div><div class="w-sub">${sub}</div></div><div class="w-amt">+${fmt(amount)}</div></div>
+    <div class="r-notes">${notes.map((t) => `<div>${t}</div>`).join('')}</div>
+    <button class="btn-main next" data-act="next">次のハンドへ</button>`;
+}
+
+/** テーブル領域（393×440 のデザイン）を、使える広さに合わせて拡大・縮小する */
+function fitStage() {
+  const area = app.querySelector('.table-area');
+  const stage = app.querySelector('.stage');
+  if (!area || !stage) return;
+  const scale = Math.min(area.clientWidth / STAGE.w, area.clientHeight / STAGE.h, 1.3);
+  const top = Math.max(0, (area.clientHeight - STAGE.h * scale) / 2);
+  stage.style.transform = `translateX(-50%) scale(${scale})`;
+  stage.style.top = `${top}px`;
 }
 
 // ---- 進行 ----
@@ -323,29 +472,50 @@ function act(action) {
     applyAction(state, action, ME);
   } catch {
     return; // 画面が古いだけなので描き直す
-  } finally {
-    raisePanel.open = false;
   }
+  pre = null;
   save();
 }
 
 function nextHand() {
   if (!state || state.phase === 'betting' && state.toActIndex !== null) return;
   startNewHand(state);
-  raisePanel.open = false;
+  pre = null;
   save();
 }
 
-/** CPU の手番なら少し待ってから行動させる */
+/** CPU の手番なら少し待ってから行動させる。自分の番で予約があれば自動で実行する */
 function scheduleBot() {
+  // 同じ手番のタイマーが動いているあいだは、描き直しても最初からやり直さない
+  // （予約ボタンなどを押すたびに CPU の動きが遅れないように）
+  if (botTimer && screen === 'table' && state && state.phase === 'betting' && botSeq === state.actionSeq) return;
   clearTimeout(botTimer);
   botTimer = null;
   if (screen !== 'table' || !state || state.phase !== 'betting') return;
   const p = toActPlayer(state);
-  if (!p || !p.isCPU) return;
+  if (!p) return;
   const seq = state.actionSeq;
-  const delay = 550 + Math.random() * 550;
+  botSeq = seq;
+  if (p.id === ME) {
+    if (!pre) return;
+    const me = p;
+    const ctx = { handNumber: state.handNumber, street: state.street, toCall: myToCall(me) };
+    if (!isPreActionValid(pre, ctx)) { pre = null; return; }
+    botTimer = setTimeout(() => {
+      botTimer = null;
+      if (!state || state.actionSeq !== seq || screen !== 'table') return;
+      const action = resolvePreAction(pre, legalActions(state, ME));
+      pre = null;
+      if (action) act(action);
+      safeRender();
+    }, 350);
+    return;
+  }
+  if (!p.isCPU) return;
+  // バッジが読めるよう、CPU は約1.0〜1.4秒かけて動く（要件 U-9）
+  const delay = 1000 + Math.random() * 400;
   botTimer = setTimeout(() => {
+    botTimer = null;
     if (!state || state.actionSeq !== seq || screen !== 'table') return;
     let action = decideCPU(state, p.id, state.settings.cpuLevel);
     try {
@@ -423,23 +593,33 @@ function handleClick(action, v) {
     case 'cpu-plus': setup.cpuCount = Math.min(CPU_MAX, setup.cpuCount + 1); store.set(SETUP_KEY, setup); break;
     case 'start': startGame(); break;
     case 'menu':
-      modal = { text: 'タイトルに戻りますか？<br><span class="dim" style="font-size:13px">「続きから」で再開できます</span>', okLabel: 'タイトルへ', cancelLabel: '続ける', ok: () => { clearTimeout(botTimer); screen = 'title'; } };
+      modal = { text: 'タイトルに戻りますか？<br><span class="dim" style="font-size:13px">「続きから」で再開できます</span>', okLabel: 'タイトルへ', cancelLabel: '続ける', ok: () => { clearTimeout(botTimer); botTimer = null; screen = 'title'; } };
       break;
     case 'modal-ok': { const ok = modal?.ok; modal = null; ok?.(); break; }
     case 'modal-cancel': modal = null; break;
     case 'fold': act({ type: 'fold' }); break;
     case 'check': act({ type: 'check' }); break;
     case 'call': act({ type: 'call' }); break;
-    case 'open-raise': {
+    case 'preset': sizing.amount = Number(v); break;
+    case 'nudge': {
       const legal = legalActions(state, ME);
-      raisePanel = { open: true, value: raiseToPotFraction(state, ME, 0.5) ?? legal.minRaiseTo, seq: state.actionSeq };
+      if (legal) sizing.amount = nudge(sizing.amount, Number(v), legal.minRaiseTo, legal.maxRaiseTo);
       break;
     }
-    case 'close-raise': raisePanel.open = false; break;
-    case 'raise-preset': raisePanel.value = Number(v); break;
     case 'do-raise': {
       const legal = legalActions(state, ME);
-      if (legal) act({ type: 'raise', to: clampRaise(raisePanel.value, legal) });
+      if (legal && legal.canRaise) {
+        const to = Math.min(Math.max(sizing.amount, legal.minRaiseTo), legal.maxRaiseTo);
+        act({ type: 'raise', to });
+      }
+      break;
+    }
+    case 'pre': {
+      // 同じ予約をもう一度押したら取り消し
+      if (pre && pre.type === v) { pre = null; break; }
+      const me = state.players.find((p) => p.id === ME);
+      const option = preActionOptions(myToCall(me)).find((o) => o.type === v);
+      if (option) pre = makePreAction(option, state.handNumber, state.street);
       break;
     }
     case 'next': nextHand(); break;
@@ -451,12 +631,25 @@ function handleClick(action, v) {
 app.addEventListener('input', (e) => {
   if (e.target.id !== 'raise-range' || !state) return;
   const legal = legalActions(state, ME);
-  if (!legal) return;
-  raisePanel.value = Number(e.target.value);
-  const amount = clampRaise(raisePanel.value, legal);
-  document.getElementById('raise-amount').textContent = amount === legal.maxRaiseTo ? `${fmt(amount)}（オールイン）` : fmt(amount);
-  document.getElementById('raise-confirm').textContent = fmt(amount);
+  if (!legal || !legal.canRaise) return;
+  const t = Number(e.target.value) / 1000;
+  sizing.amount = amountAt(t, legal.minRaiseTo, legal.maxRaiseTo);
+  const pct = `${(t * 100).toFixed(1)}%`;
+  const slider = e.target.closest('.slider');
+  slider.querySelector('.fill').style.width = pct;
+  slider.querySelector('.thumb').style.left = `calc(${pct} - 12px)`;
+  const r = raiseTexts(legal, sizing.amount);
+  document.getElementById('raise-label').textContent = r.label;
+  document.getElementById('raise-sub').textContent = r.sub;
+  let marked = false;
+  for (const b of app.querySelectorAll('.preset')) {
+    const on = !marked && Number(b.dataset.v) === sizing.amount;
+    if (on) marked = true;
+    b.classList.toggle('on', on);
+  }
 });
+
+window.addEventListener('resize', fitStage);
 
 // ---- オフライン対応（Service Worker） ----
 async function isCached() {
@@ -469,6 +662,15 @@ async function isCached() {
 
 async function setUpOffline() {
   if (!('serviceWorker' in navigator)) { offlineReady = false; return; }
+  // 新しい版が有効になったら読み込み直して表示を切り替える（初めて入れたときは何もしない）
+  const hadController = !!navigator.serviceWorker.controller;
+  let reloading = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (!hadController || reloading) return;
+    reloading = true;
+    save();
+    location.reload();
+  });
   try {
     await navigator.serviceWorker.register('sw.js');
     const reg = await navigator.serviceWorker.ready;

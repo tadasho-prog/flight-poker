@@ -149,3 +149,38 @@ function popcount(x) {
   while (x) { x &= x - 1; n++; }
   return n;
 }
+
+// ---- 表示用 ----
+const RANK_NAME = (r) => ({ 14: 'A', 13: 'K', 12: 'Q', 11: 'J' }[r] ?? String(r));
+
+/** 役の詳しい説明（要件 U-16）。例：「Jのペア」「Aハイ」「KとJのツーペア」 */
+export function describeHand(value) {
+  const [a, b] = value.tiebreakers;
+  switch (value.category) {
+    case CATEGORY.HIGH_CARD: return `${RANK_NAME(a)}ハイ`;
+    case CATEGORY.ONE_PAIR: return `${RANK_NAME(a)}のペア`;
+    case CATEGORY.TWO_PAIR: return `${RANK_NAME(a)}と${RANK_NAME(b)}のツーペア`;
+    case CATEGORY.THREE: return `${RANK_NAME(a)}のスリーカード`;
+    case CATEGORY.STRAIGHT: return `${RANK_NAME(a)}ハイ`;
+    case CATEGORY.FLUSH: return `${RANK_NAME(a)}ハイ`;
+    case CATEGORY.FULL_HOUSE: return `${RANK_NAME(a)}の3枚と${RANK_NAME(b)}の2枚`;
+    case CATEGORY.FOUR: return `${RANK_NAME(a)}のフォーカード`;
+    case CATEGORY.STRAIGHT_FLUSH: return a === 14 ? '' : `${RANK_NAME(a)}ハイ`;
+    default: return '';
+  }
+}
+
+/** 役名＋説明（例：「フラッシュ（Aハイ）」） */
+export function handLabel(value) {
+  const d = describeHand(value);
+  return d ? `${value.name}（${d}）` : value.name;
+}
+
+/** 役を作っているカード（キッカーを除く）。強調表示に使う */
+export function madeCards(value) {
+  const count = {
+    [CATEGORY.HIGH_CARD]: 0, [CATEGORY.ONE_PAIR]: 2, [CATEGORY.TWO_PAIR]: 4, [CATEGORY.THREE]: 3,
+    [CATEGORY.STRAIGHT]: 5, [CATEGORY.FLUSH]: 5, [CATEGORY.FULL_HOUSE]: 5, [CATEGORY.FOUR]: 4, [CATEGORY.STRAIGHT_FLUSH]: 5,
+  }[value.category];
+  return value.bestFive.slice(0, count);
+}
