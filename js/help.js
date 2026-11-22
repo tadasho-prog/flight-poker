@@ -1,0 +1,56 @@
+// 遊び方・役の強さ（要件 U-7）
+import { parseCards, rankSymbol, SUIT_SYMBOLS, isRed } from './cards.js';
+
+const card = (c) => `<span class="card w-sm ${isRed(c) ? 'red' : ''}"><b>${rankSymbol(c.r)}</b><i>${SUIT_SYMBOLS[c.s]}</i></span>`;
+
+const RANKS = [
+  ['ロイヤルフラッシュ', 'As Ks Qs Js Ts', '同じマークの 10・J・Q・K・A'],
+  ['ストレートフラッシュ', '9h 8h 7h 6h 5h', '同じマークで数字が5つ連続'],
+  ['フォーカード', 'Qs Qh Qd Qc 3s', '同じ数字が4枚'],
+  ['フルハウス', 'Ks Kh Kd 7c 7s', 'スリーカード＋ワンペア'],
+  ['フラッシュ', 'Ad Jd 8d 4d 2d', '同じマークが5枚'],
+  ['ストレート', 'Ts 9h 8d 7c 6s', '数字が5つ連続（A-2-3-4-5 も可）'],
+  ['スリーカード', '8s 8h 8d Kc 2s', '同じ数字が3枚'],
+  ['ツーペア', 'Js Jh 4d 4c As', 'ペアが2組'],
+  ['ワンペア', 'Ts Th Ad 7c 3s', 'ペアが1組'],
+  ['ハイカード', 'As Jh 8d 5c 2s', '役なし（一番強いカードで比べる）'],
+];
+
+export function renderHelp() {
+  const rows = RANKS.map(([name, cards, desc], i) => `<div class="rank-row">
+      <span class="no">${i + 1}</span>
+      <div style="flex:1;min-width:0"><div class="nm" style="width:auto">${name}</div><div class="faint" style="font-size:11px">${desc}</div></div>
+      <div class="ex">${parseCards(cards).map(card).join('')}</div></div>`).join('');
+  return `<div class="page-head"><button class="link" data-act="help-back">戻る</button><h2>遊び方・役の強さ</h2><span style="min-width:56px"></span></div>
+    <div class="help">
+      <h3>役の強さ（上ほど強い）</h3>
+      ${rows}
+      <p>同じ役どうしは、役を作っている数字 → 残りのカード（キッカー）の順に、大きいほうが勝ち。マーク（♠♥♦♣）に強さの差はありません。</p>
+
+      <h3>流れ</h3>
+      <ul>
+        <li>手札2枚と、場に出る共通カード5枚のうち、好きな5枚で一番強い役を作ります。</li>
+        <li>プリフロップ（手札だけ）→ フロップ（場に3枚）→ ターン（4枚目）→ リバー（5枚目）の順に、それぞれ賭けます。</li>
+        <li>最後まで残った人で手札を見せ合い（ショーダウン）、一番強い役の人がポットをもらいます。</li>
+        <li>自分以外が全員降りたら、その時点で勝ちです。</li>
+      </ul>
+
+      <h3>アクション</h3>
+      <ul>
+        <li><b>チェック</b>：賭けずに次の人へ（まだ誰も賭けていないとき）</li>
+        <li><b>ベット</b>：最初に賭ける（最低 3,000）</li>
+        <li><b>コール</b>：前の人と同じ額を賭ける</li>
+        <li><b>レイズ</b>：前の人より多く賭ける（最低でも直前の上げ幅以上）</li>
+        <li><b>フォールド</b>：降りる（そのハンドに賭けたチップは戻りません）</li>
+        <li><b>オールイン</b>：手持ちを全部賭ける。足りない分は「サイドポット」に分かれ、自分が賭けた分までしかもらえません。</li>
+      </ul>
+
+      <h3>このアプリのルール</h3>
+      <ul>
+        <li>キャッシュゲーム：ブラインドは SB 1,000 / BB 3,000 で固定。終わりはなく、好きなところでやめられます。</li>
+        <li>チップが 0 になると、開始チップと同じ額を自動で買い足します。<b>収支</b>は「今のチップ − 買ったチップの合計」です。</li>
+        <li>D＝ディーラーボタン、SB／BB＝ブラインドを払う人。毎ハンド1つずつ左へ動きます。</li>
+        <li>途中でやめても自動で保存され、タイトルの「続きから」で再開できます。</li>
+      </ul>
+    </div>`;
+}
