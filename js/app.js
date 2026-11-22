@@ -1,9 +1,9 @@
 // 画面と操作。ゲームの進行は game.js、CPU の判断は cpu.js。
 import {
   createGame, createPlayer, startNewHand, applyAction, legalActions, toActPlayer, raiseToPotFraction,
-  pot, net, smallBlindIndex, bigBlindIndex, BUY_IN_OPTIONS, STREET_NAMES, ACTION_NAMES,
+  pot, net, smallBlindIndex, bigBlindIndex, isValidState, BUY_IN_OPTIONS, STREET_NAMES, ACTION_NAMES,
 } from './game.js';
-import { decideCPU, CPU_LEVELS } from './cpu.js';
+import { decideCPU, estimateEquity, CPU_LEVELS } from './cpu.js';
 import { rankSymbol, SUIT_SYMBOLS, isRed, sameCard } from './cards.js';
 import { evaluate } from './evaluator.js';
 import { renderHelp } from './help.js';
@@ -28,7 +28,8 @@ let state = null;           // ゲームの状態（game.js）
 let savedAt = null;
 let screen = 'title';       // title | setup | table | help
 let helpReturn = 'title';
-let setup = { buyIn: 100000, cpuCount: 5, cpuLevel: 'normal', ...(store.get(SETUP_KEY) ?? {}) };
+let setup = { buyIn: 100000, cpuCount: 5, cpuLevel: 'normal', showEquity: false, ...(store.get(SETUP_KEY) ?? {}) };
+let equityCache = { key: null, value: null };
 let raisePanel = { open: false, value: 0, seq: -1 };
 let modal = null;           // { text, ok, okLabel, cancelLabel }
 let botTimer = null;
@@ -40,7 +41,7 @@ const manYen = (n) => `${n / 10000}万`;
 
 function loadSave() {
   const data = store.get(SAVE_KEY);
-  if (!data || !data.state || !Array.isArray(data.state.players)) return null;
+  if (!data || !isValidState(data.state)) return null; // 壊れた保存は使わない
   return data;
 }
 
@@ -78,6 +79,19 @@ function winningCards() {
   return hand ? hand.value.bestFive : [];
 }
 const inList = (list, card) => list.some((c) => sameCard(c, card));
+
+/** 勝率の目安（要件 L-2）。街・残り人数が変わったときだけ計算し直す */
+function equityText() {
+  const s = state;
+  const me = s.players.find((p) => p.id === ME);
+  if (!s.settings.showEquity || s.phase !== 'betting' || me.folded) return '';
+  const opponents = s.players.filter((p) => p.id !== ME && !p.folded).length;
+  const key = `${s.handNumber}:${s.board.length}:${opponents}`;
+  if (equityCache.key !== key) {
+    equityCache = { key, value: estimateEquity(me.holeCards, s.board, opponents, 1500) };
+  }
+  return `<span class="dim">${s.board.length >= 3 ? '　' : ''}勝率 約${Math.round(equityCache.value * 100)}%</span>`;
+}
 
 // ---- 画面 ----
 function render() {
@@ -141,6 +155,12 @@ function renderSetup() {
           ${seg(Object.entries(CPU_LEVELS), setup.cpuLevel, 'set-level')}
         </div>
       </div>
+      <div>
+        <div class="field-label">練習用</div>
+        <div class="box"><div class="stepper"><span style="font-size:15px">勝率の目安を表示</span></div>
+          <div style="margin-top:10px">${seg([['off', '表示しない'], ['on', '表示する']], setup.showEquity ? 'on' : 'off', 'set-equity')}</div>
+          <div class="note">相手の手札をランダムと仮定した、今の自分の勝率の目安です</div></div>
+      </div>
       <button class="btn blue" data-act="start" style="flex:none">ゲーム開始</button>
     </div>`;
 }
@@ -200,7 +220,7 @@ function renderTable() {
         <div class="nm">${me.name}${badges(meIndex)}</div>
         <div class="stk num">${fmt(me.stack)}</div>
         <div class="sub num ${net(me) >= 0 ? 'plus' : 'minus'}">収支 ${signed(net(me))}</div>
-        <div class="sub">${myHand}</div>
+        <div class="sub">${myHand}${equityText()}</div>
       </div>
       ${me.streetBet > 0 && s.phase === 'betting' ? `<div class="bet num"><small>ベット</small>${fmt(me.streetBet)}</div>` : ''}
     </div>
@@ -291,7 +311,7 @@ function renderResult() {
 function startGame() {
   const players = [createPlayer(ME, 'あなた', false, setup.buyIn)];
   for (let k = 1; k <= setup.cpuCount; k++) players.push(createPlayer(`cpu-${k}`, `CPU ${k}`, true, setup.buyIn));
-  state = createGame({ buyIn: setup.buyIn, cpuLevel: setup.cpuLevel }, players, Math.floor(Math.random() * players.length));
+  state = createGame({ buyIn: setup.buyIn, cpuLevel: setup.cpuLevel, showEquity: setup.showEquity }, players, Math.floor(Math.random() * players.length));
   startNewHand(state);
   save();
   screen = 'table';
@@ -337,16 +357,52 @@ function scheduleBot() {
       applyAction(state, action, p.id);
     }
     save();
-    render();
+    safeRender();
   }, delay);
 }
+
+// ---- 予期しないエラーのとき：真っ白で止まらず、戻る手段を出す ----
+function showCrash(err) {
+  clearTimeout(botTimer);
+  botTimer = null;
+  modal = null;
+  const msg = String(err?.message ?? err).replace(/[<>&]/g, '');
+  app.classList.remove('has-result');
+  app.innerHTML = `<div class="title-screen">
+      <h1 style="font-size:24px">問題が発生しました</h1>
+      <p class="dim" style="font-size:14px;line-height:1.7">ゲームを続けられなくなりました。<br>タイトルに戻ってやり直してください。</p>
+      <div class="menu">
+        <button class="btn blue" data-act="crash-title">タイトルへ戻る</button>
+        <button class="btn gray" data-act="crash-reset">保存データを消して最初から</button>
+      </div>
+      <p class="faint" style="font-size:11px">${msg}</p>
+    </div>`;
+}
+
+function safeRender() {
+  try { render(); } catch (err) { showCrash(err); }
+}
+
+window.addEventListener('error', (e) => showCrash(e.error ?? e.message));
+window.addEventListener('unhandledrejection', (e) => showCrash(e.reason));
 
 // ---- 操作 ----
 app.addEventListener('click', (e) => {
   const el = e.target.closest('[data-act]');
   if (!el || el.disabled) return;
-  const v = el.dataset.v;
-  switch (el.dataset.act) {
+  try {
+    handleClick(el.dataset.act, el.dataset.v);
+  } catch (err) {
+    showCrash(err);
+    return;
+  }
+  safeRender();
+});
+
+function handleClick(action, v) {
+  switch (action) {
+    case 'crash-title': state = null; screen = 'title'; break;
+    case 'crash-reset': store.remove(SAVE_KEY); state = null; screen = 'title'; break;
     case 'new':
       if (loadSave()) {
         modal = { text: '保存中のゲームは消えます。<br>新しく始めますか？', okLabel: '新しく始める', ok: () => { screen = 'setup'; } };
@@ -362,6 +418,7 @@ app.addEventListener('click', (e) => {
     case 'to-title': screen = 'title'; break;
     case 'set-buyin': setup.buyIn = Number(v); store.set(SETUP_KEY, setup); break;
     case 'set-level': setup.cpuLevel = v; store.set(SETUP_KEY, setup); break;
+    case 'set-equity': setup.showEquity = v === 'on'; store.set(SETUP_KEY, setup); break;
     case 'cpu-minus': setup.cpuCount = Math.max(CPU_MIN, setup.cpuCount - 1); store.set(SETUP_KEY, setup); break;
     case 'cpu-plus': setup.cpuCount = Math.min(CPU_MAX, setup.cpuCount + 1); store.set(SETUP_KEY, setup); break;
     case 'start': startGame(); break;
@@ -386,10 +443,9 @@ app.addEventListener('click', (e) => {
       break;
     }
     case 'next': nextHand(); break;
-    default: return;
+    default: break;
   }
-  render();
-});
+}
 
 // スライダーは描き直さずに数字だけ更新する（指の動きを止めないため）
 app.addEventListener('input', (e) => {
@@ -431,8 +487,8 @@ async function setUpOffline() {
   } catch {
     offlineReady = false;
   }
-  if (screen === 'title' && !modal) render();
+  if (screen === 'title' && !modal) safeRender();
 }
 
-render();
+safeRender();
 setUpOffline();

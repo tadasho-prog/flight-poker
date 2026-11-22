@@ -356,3 +356,32 @@ export function computePots(contributions) {
   });
   return pots;
 }
+
+/**
+ * 保存データとして読み込んだ state が壊れていないか（要件 S-1・安定性）。
+ * 壊れていたら「続きから」は出さずに新しく始めてもらう。
+ */
+export function isValidState(s) {
+  const isCard = (c) => c && Number.isInteger(c.r) && c.r >= 2 && c.r <= 14 && Number.isInteger(c.s) && c.s >= 0 && c.s <= 3;
+  try {
+    if (!s || typeof s !== 'object' || !Array.isArray(s.players)) return false;
+    const n = s.players.length;
+    if (n < 2 || n > MAX_SEATS) return false;
+    if (!['notStarted', 'betting', 'handComplete'].includes(s.phase)) return false;
+    if (!Number.isInteger(s.dealerIndex) || s.dealerIndex < 0 || s.dealerIndex >= n) return false;
+    if (!Array.isArray(s.board) || !s.board.every(isCard) || !Array.isArray(s.deck) || !s.deck.every(isCard)) return false;
+    if (!s.settings || !Number.isInteger(s.settings.buyIn) || !Number.isInteger(s.settings.bigBlind)) return false;
+    for (const p of s.players) {
+      if (typeof p.id !== 'string' || !Number.isInteger(p.stack) || p.stack < 0) return false;
+      if (!Array.isArray(p.holeCards) || !p.holeCards.every(isCard)) return false;
+    }
+    if (s.phase === 'betting') {
+      if (!Number.isInteger(s.toActIndex) || s.toActIndex < 0 || s.toActIndex >= n) return false;
+      if (s.players[s.toActIndex].folded || s.players[s.toActIndex].allIn) return false;
+    }
+    if (s.phase === 'handComplete' && (!s.lastResult || !Array.isArray(s.lastResult.pots))) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
