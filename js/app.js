@@ -11,7 +11,7 @@ import { preActionOptions, makePreAction, isPreActionValid, resolvePreAction } f
 import { seatLayout, STAGE, MY_SPOT } from './seats.js';
 import { renderHelp } from './help.js';
 
-const APP_VERSION = 'ver.3（2026-11-23 テーブル画面リニューアル）';
+const APP_VERSION = 'ver.3.1（2026-11-23 テーブル画面リニューアル）';
 const SAVE_KEY = 'flightpoker.save.v1';
 const SETUP_KEY = 'flightpoker.setup.v1';
 const ME = 'me';
@@ -630,12 +630,38 @@ function handleClick(action, v) {
 // スライダーは描き直さずに数字だけ更新する（指の動きを止めないため）
 app.addEventListener('input', (e) => {
   if (e.target.id !== 'raise-range' || !state) return;
-  const legal = legalActions(state, ME);
-  if (!legal || !legal.canRaise) return;
-  const t = Number(e.target.value) / 1000;
-  sizing.amount = amountAt(t, legal.minRaiseTo, legal.maxRaiseTo);
-  const pct = `${(t * 100).toFixed(1)}%`;
+  setSliderPosition(e.target.closest('.slider'), Number(e.target.value) / 1000);
+});
+
+// 指で触った位置にそのまま合わせる（iOS の Safari はバーをタップしても値が飛ばないため、自前で扱う）
+let dragging = null;
+function sliderPoint(e) {
+  const rect = dragging.getBoundingClientRect();
+  return Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+}
+app.addEventListener('pointerdown', (e) => {
   const slider = e.target.closest('.slider');
+  if (!slider || !legalActions(state, ME)?.canRaise) return;
+  dragging = slider;
+  try { slider.setPointerCapture(e.pointerId); } catch { /* 合成イベントなど */ }
+  setSliderPosition(slider, sliderPoint(e));
+  e.preventDefault();
+});
+app.addEventListener('pointermove', (e) => {
+  if (!dragging) return;
+  setSliderPosition(dragging, sliderPoint(e));
+});
+const endDrag = () => { dragging = null; };
+app.addEventListener('pointerup', endDrag);
+app.addEventListener('pointercancel', endDrag);
+
+function setSliderPosition(slider, t) {
+  const legal = legalActions(state, ME);
+  if (!slider || !legal || !legal.canRaise) return;
+  sizing.amount = amountAt(t, legal.minRaiseTo, legal.maxRaiseTo);
+  const range = slider.querySelector('input');
+  if (range) range.value = String(Math.round(t * 1000));
+  const pct = `${(t * 100).toFixed(1)}%`;
   slider.querySelector('.fill').style.width = pct;
   slider.querySelector('.thumb').style.left = `calc(${pct} - 12px)`;
   const r = raiseTexts(legal, sizing.amount);
@@ -647,7 +673,7 @@ app.addEventListener('input', (e) => {
     if (on) marked = true;
     b.classList.toggle('on', on);
   }
-});
+}
 
 window.addEventListener('resize', fitStage);
 
