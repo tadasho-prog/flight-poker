@@ -1,6 +1,6 @@
 // オフライン対応（要件 O-1）。初回に全ファイルを端末に保存し、以降は保存したものから表示する。
 // ファイルを更新したら CACHE の番号を上げること（古い保存は自動で消える）。
-const CACHE = 'flightpoker-v4';
+const CACHE = 'flightpoker-v5';
 const FILES = [
   './',
   'index.html',
@@ -9,6 +9,7 @@ const FILES = [
   'js/app.js',
   'js/cards.js',
   'js/cpu.js',
+  'js/duo.js',
   'js/evaluator.js',
   'js/game.js',
   'js/help.js',

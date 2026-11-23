@@ -110,3 +110,46 @@ export function decideCPU(state, playerId, level, rand = Math.random) {
   if (equity >= potOdds + 0.03) return { type: 'call' };
   return foldOrCheck();
 }
+
+/**
+ * 手札が分かっている人たち（hands）それぞれの勝率の目安（要件 M-7）。
+ * unknownOpponents 人ぶんは手札をランダムとして計算する（CPU の手札は見ない）。引き分けは等分。
+ */
+export function equityKnown(hands, board, unknownOpponents, iterations, rand = Math.random) {
+  const k = hands.length;
+  const result = new Array(k).fill(0);
+  if (k === 0 || hands.some((h) => h.length !== 2)) return result;
+  const known = new Set([...hands.flat(), ...board].map(cardKey));
+  const pool = fullDeck().filter((c) => !known.has(cardKey(c)));
+  const boardNeed = 5 - board.length;
+  const need = boardNeed + unknownOpponents * 2;
+  if (need > pool.length || iterations <= 0) return result;
+
+  const sevens = hands.map((h) => [...h, ...board, ...Array(boardNeed).fill(h[0])]);
+  const other = sevens[0].slice();
+  const scores = new Array(k);
+  for (let it = 0; it < iterations; it++) {
+    for (let j = 0; j < need; j++) {
+      const r = j + randInt(rand, pool.length - j);
+      const t = pool[j]; pool[j] = pool[r]; pool[r] = t;
+    }
+    for (const seven of sevens) for (let b = 0; b < boardNeed; b++) seven[2 + board.length + b] = pool[b];
+    let best = -1;
+    for (let h = 0; h < k; h++) { scores[h] = score(sevens[h]); if (scores[h] > best) best = scores[h]; }
+    let unknownTies = 0;
+    let lost = false;
+    for (let b = 2; b < 7; b++) other[b] = sevens[0][b];
+    for (let o = 0; o < unknownOpponents; o++) {
+      other[0] = pool[boardNeed + o * 2];
+      other[1] = pool[boardNeed + o * 2 + 1];
+      const s = score(other);
+      if (s > best) { lost = true; break; }
+      if (s === best) unknownTies++;
+    }
+    if (lost) continue;
+    let winners = unknownTies;
+    for (let h = 0; h < k; h++) if (scores[h] === best) winners++;
+    for (let h = 0; h < k; h++) if (scores[h] === best) result[h] += 1 / winners;
+  }
+  return result.map((v) => v / iterations);
+}
