@@ -52,11 +52,20 @@ export function humanToAct(state) {
   return p && !p.isCPU ? p : null;
 }
 
+/** もう片方がフォールドして、ハンドに残っている人が1人だけならその id（要件 M-4 版2.5）。それ以外は null */
+export function soleHumanId(state) {
+  if (!isDuo(state) || state.phase !== 'betting') return null;
+  const humans = state.players.filter((p) => !p.isCPU);
+  const live = humans.filter((p) => !p.folded);
+  return humans.length >= 2 && live.length === 1 ? live[0].id : null;
+}
+
 /** 受け渡し画面を出すか（要件 M-4） */
 export function needsHandoff(state) {
   if (!isDuo(state) || state.view.revealAll) return false;
   const h = humanToAct(state);
-  return !!h && state.view.unlockedId !== h.id;
+  if (!h || soleHumanId(state) === h.id) return false;
+  return state.view.unlockedId !== h.id;
 }
 
 /** 受け渡し画面で「手札を見る」を押した */
@@ -72,7 +81,7 @@ export function viewerId(state) {
   if (!isDuo(state)) return SOLO_ID;
   const h = humanToAct(state);
   if (state.view.revealAll && h) return h.id;
-  return state.view.viewerId;
+  return soleHumanId(state) ?? state.view.viewerId;
 }
 
 /** その人の手札を表にしてよいか（要件 M-5, M-7）。ショーダウンで公開された手札は別に扱う */
@@ -80,7 +89,8 @@ export function canSeeCards(state, id) {
   if (!isDuo(state)) return id === SOLO_ID;
   if (state.players.find((p) => p.id === id)?.isCPU !== false) return false;
   if (state.view.revealAll) return true;
-  return state.view.unlockedId === id && humanToAct(state)?.id === id;
+  if (humanToAct(state)?.id !== id) return false;
+  return state.view.unlockedId === id || soleHumanId(state) === id;
 }
 
 /** 今ボタンを押して動ける人（受け渡しが済んでいる手番の人）。いなければ null */

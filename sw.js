@@ -1,6 +1,6 @@
 // オフライン対応（要件 O-1）。初回に全ファイルを端末に保存し、以降は保存したものから表示する。
 // ファイルを更新したら CACHE の番号を上げること（古い保存は自動で消える）。
-const CACHE = 'flightpoker-v6';
+const CACHE = 'flightpoker-v7';
 const FILES = [
   './',
   'index.html',

@@ -16,7 +16,7 @@ import {
   describeMove, movesSince,
 } from './duo.js';
 
-const APP_VERSION = 'ver.3.3（2026-11-23 2人モードの改善）';
+const APP_VERSION = 'ver.3.4（2026-11-23 フォールド後の受け渡しを省略）';
 const SETUP_KEY = 'flightpoker.setup.v1';
 const CPU_MIN = 2;
 const CPU_MAX = 9;
