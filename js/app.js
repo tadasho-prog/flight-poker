@@ -13,9 +13,10 @@ import { renderHelp } from './help.js';
 import {
   SOLO_ID, MODES, MODE_KEYS, modeOf, isDuo, humanColor, createPlayersFor, initView, needsHandoff, confirmHandoff,
   viewerId, canSeeCards, actorId, noteAction, noteNewHand, setReveal, turnsUntil, nextHumanTurn, humanToAct,
+  describeMove, movesSince,
 } from './duo.js';
 
-const APP_VERSION = 'ver.3.2（2026-11-23 2人で遊ぶモード）';
+const APP_VERSION = 'ver.3.3（2026-11-23 2人モードの改善）';
 const SETUP_KEY = 'flightpoker.setup.v1';
 const CPU_MIN = 2;
 const CPU_MAX = 9;
@@ -209,23 +210,34 @@ function myToCall(me) {
   return Math.min(Math.max(0, state.currentBet - me.streetBet), me.stack);
 }
 
-/** 受け渡し画面（要件 M-4）。テーブルは見せず、公開されている情報だけ出す */
+/** 収支の表示（±0 / +1,000 / −1,000） */
+const netLabel = (v) => (v === 0 ? '±0' : v > 0 ? `+${fmt(v)}` : `−${fmt(-v)}`);
+const humanName = (id) => `<span class="${colorCls(id).trim()}">${nameOf(id)}</span>`;
+
+/** 受け渡し画面（要件 M-4）。テーブルは見せず、公開されている情報（場のカード・ポット・直前の動き・収支）だけ出す */
 function renderHandoff() {
   const s = state;
   const h = humanToAct(s);
   const toCall = myToCall(h);
-  const info = `${STREET_PILL[s.street]}・ポット ${fmt(pot(s))}${toCall > 0 ? `・コールに ${fmt(toCall)}` : ''}`;
+  const board = Array.from({ length: 5 }, (_, k) => (k < s.board.length ? pcard(s.board[k], 34) : '<span class="slot ho-slot"></span>')).join('');
+  const moves = movesSince(s, h.id).map((m) => `<div>${humanName(m.id)} ${m.text}${m.street !== s.street ? `<span class="faint">（${STREET_PILL[m.street]}）</span>` : ''}</div>`).join('');
+  // ハンドの途中で賭けている分は引かず、このハンドが始まる前の収支を出す（2人とも −3,000 のように見えないように）
+  const nets = s.players.filter((p) => !p.isCPU).map((p) => `${humanName(p.id)} ${netLabel(net(p) + p.totalCommitted)}`).join('　');
   return `<div class="t-head">
       <b>ハンド #${s.handNumber}</b>
       <span class="grow"></span>
       <button class="round" data-act="menu" aria-label="中断"><svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 3l10 10M13 3L3 13"></path></svg></button>
     </div>
     <div class="handoff${colorCls(h.id)}">
-      <div class="ho-card"></div>
       <div class="ho-name">${h.name}</div>
       <div class="ho-msg">さんの番です</div>
       <div class="ho-sub">スマホを ${h.name} さんに渡してください。<br>相手に見えないようにしてから押してください</div>
-      <div class="ho-info">${info}</div>
+      <div class="ho-info">
+        <div class="ho-board">${board}</div>
+        <div class="ho-pot">${STREET_PILL[s.street]}・ポット <b>${fmt(pot(s))}</b>・${toCall > 0 ? `コールに <b>${fmt(toCall)}</b>` : 'チェックできます'}</div>
+        ${moves ? `<div class="ho-moves"><div class="ho-cap">直前の動き</div>${moves}</div>` : ''}
+        <div class="ho-nets">収支（このハンドの前）　${nets}</div>
+      </div>
       <button class="btn-main ho-btn" data-act="handoff">${h.name} です ── 手札を見る</button>
       <button class="link ho-reveal" data-act="reveal">2人の手札を表示して続ける</button>
     </div>`;
@@ -516,6 +528,7 @@ function renderResultActions(me, result, shown) {
     if (p.eligibleIds.length === 1) notes.push(`${nameOf(p.eligibleIds[0])} に ${fmt(p.amount)} を返却（コールされなかった分）`);
     else notes.push(`サイドポット${i}（${fmt(p.amount)}）：${p.winnerIds.map(nameOf).join('・')}（${p.winningHandName}）`);
   });
+  if (isDuo(s)) notes.unshift(`収支：${s.players.filter((p) => !p.isCPU).map((p) => `${humanName(p.id)} ${netLabel(net(p))}`).join('　')}`);
   if (!isDuo(s) && me.stack === 0) notes.push(`チップがなくなったので、次のハンドで ${fmt(s.settings.buyIn)} を買い足します`);
   const bust = s.players.filter((p) => (isDuo(s) || p.isCPU) && p.stack === 0).map((p) => p.name);
   if (bust.length) notes.push(`次のハンドで ${fmt(s.settings.buyIn)} を買い足し：${bust.join('・')}`);
@@ -551,12 +564,14 @@ function startGame() {
 function act(action) {
   const id = state && actorId(state);
   if (!id) return;
+  const street = state.street;
+  const text = describeMove(legalActions(state, id), action, state.players.find((p) => p.id === id).stack);
   try {
     applyAction(state, action, id);
   } catch {
     return; // 画面が古いだけなので描き直す
   }
-  noteAction(state, id);
+  noteAction(state, id, text, street);
   pre = null;
   save();
 }
@@ -603,15 +618,17 @@ function scheduleBot() {
     botTimer = null;
     if (!state || state.actionSeq !== seq || screen !== 'table') return;
     let action = decideCPU(state, p.id, state.settings.cpuLevel);
+    const legal = legalActions(state, p.id);
+    const street = state.street;
+    const stackBefore = p.stack;
     try {
       applyAction(state, action, p.id);
     } catch {
       // 念のため：判断が不正でも必ず合法な手で進める
-      const legal = legalActions(state, p.id);
       action = legal.canCheck ? { type: 'check' } : { type: 'fold' };
       applyAction(state, action, p.id);
     }
-    noteAction(state, p.id);
+    noteAction(state, p.id, describeMove(legal, action, stackBefore), street);
     save();
     safeRender();
   }, delay);
@@ -643,9 +660,20 @@ window.addEventListener('error', (e) => showCrash(e.error ?? e.message));
 window.addEventListener('unhandledrejection', (e) => showCrash(e.reason));
 
 // ---- 操作 ----
+// 素早い2度押しで、次の画面の同じ位置のボタン（次の人のアクション、次のハンドの自分のフォールドなど）まで
+// 押されてしまわないよう、進行するボタンを押した直後は少しのあいだ操作ボタンを受け付けない
+const STEP_ACTS = new Set(['fold', 'check', 'call', 'do-raise', 'next', 'handoff']);
+const GUARDED_ACTS = new Set(['fold', 'check', 'call', 'do-raise', 'next', 'preset', 'nudge', 'pre', 'reveal']);
+const GUARD_MS = 450;
+let lastStepAt = 0;
+
 app.addEventListener('click', (e) => {
   const el = e.target.closest('[data-act]');
   if (!el || el.disabled) return;
+  const act = el.dataset.act;
+  const guardMs = typeof window.__guardMs === 'number' ? window.__guardMs : GUARD_MS; // 自動テストでは 0 にできる
+  if (GUARDED_ACTS.has(act) && Date.now() - lastStepAt < guardMs) return;
+  if (STEP_ACTS.has(act)) lastStepAt = Date.now();
   try {
     handleClick(el.dataset.act, el.dataset.v);
   } catch (err) {
@@ -676,7 +704,16 @@ function handleClick(action, v) {
       break;
     }
     case 'handoff': if (state) { confirmHandoff(state); save(); } break;
-    case 'reveal': if (state && isDuo(state)) { setReveal(state, !state.view.revealAll); save(); } break;
+    case 'reveal':
+      if (!state || !isDuo(state)) break;
+      if (state.view.revealAll) { setReveal(state, false); save(); break; }
+      // 誤って押して相手の手札が見えないよう、表にするときだけ確かめる
+      modal = {
+        text: '2人の手札を表にしますか？<br><span class="dim" style="font-size:13px">相手の手札も見えるようになります。<br>「手札を隠す」で元に戻せます</span>',
+        okLabel: '表にする', cancelLabel: 'やめる',
+        ok: () => { if (state && isDuo(state)) { setReveal(state, true); save(); } },
+      };
+      break;
     case 'help': helpReturn = screen; screen = 'help'; break;
     case 'help-back': screen = helpReturn; break;
     case 'to-title': screen = 'title'; break;

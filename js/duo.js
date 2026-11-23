@@ -40,6 +40,8 @@ export function initView(state, { resumed = false } = {}) {
     viewerId: humans.includes(v.viewerId) ? v.viewerId : humans[0],
     unlockedId: !resumed && humans.includes(v.unlockedId) ? v.unlockedId : null,
     revealAll: v.revealAll === true,
+    log: Array.isArray(v.log) ? v.log.filter((m) => m && typeof m.id === 'string' && typeof m.text === 'string').slice(-30) : [],
+    logHand: Number.isInteger(v.logHand) ? v.logHand : state.handNumber,
   };
 }
 
@@ -89,16 +91,47 @@ export function actorId(state) {
   return canSeeCards(state, h.id) ? h.id : null;
 }
 
-/** 誰かが動いたあと：同じ人が続けて動くときだけ手札を表のままにする */
-export function noteAction(state, id) {
+const yen = (n) => n.toLocaleString('ja-JP');
+
+/** 動きの説明（受け渡し画面の「直前の動き」用）。legal は動く前の legalActions */
+export function describeMove(legal, action, stack) {
+  if (!legal || !action) return '';
+  switch (action.type) {
+    case 'fold': return 'フォールド';
+    case 'check': return 'チェック';
+    case 'call': return legal.callAmount >= stack ? 'オールイン' : `コール ${yen(legal.callAmount)}`;
+    case 'raise': return action.to >= legal.maxRaiseTo ? `オールイン ${yen(action.to)}` : `${legal.isBet ? 'ベット' : 'レイズ'} ${yen(action.to)}`;
+    default: return '';
+  }
+}
+
+/** この人が前に動いてから今までの動き（最新の4つまで）。[{ id, text, street }] */
+export function movesSince(state, id) {
+  const log = state.view?.log;
+  if (!Array.isArray(log) || state.view.logHand !== state.handNumber) return [];
+  let start = 0;
+  for (let k = log.length - 1; k >= 0; k--) if (log[k].id === id) { start = k + 1; break; }
+  return log.slice(start).slice(-4);
+}
+
+/** 誰かが動いたあと：同じ人が続けて動くときだけ手札を表のままにする。text は動きの説明（記録用） */
+export function noteAction(state, id, text = '', street = state.street) {
   if (!isDuo(state)) return;
+  if (state.view.logHand !== state.handNumber || !Array.isArray(state.view.log)) {
+    state.view.log = [];
+    state.view.logHand = state.handNumber;
+  }
+  if (text) state.view.log.push({ id, text, street });
   const p = state.players.find((q) => q.id === id);
   if (p && !p.isCPU) state.view.viewerId = id;
   state.view.unlockedId = humanToAct(state)?.id === id && p && !p.isCPU ? id : null;
 }
 
 export function noteNewHand(state) {
-  if (isDuo(state)) state.view.unlockedId = null;
+  if (!isDuo(state)) return;
+  state.view.unlockedId = null;
+  state.view.log = [];
+  state.view.logHand = state.handNumber;
 }
 
 /** 「手札を表示／隠す」（要件 M-7）。隠すときは、今の手番の人の手札だけ表のまま */

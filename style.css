@@ -417,3 +417,16 @@ button:disabled { opacity: 0.45; cursor: default; }
 .seat.c-blue .blind, .seat.c-pink .blind { padding: 0 3px; letter-spacing: 0; }
 .t-head b, .t-head .blinds { white-space: nowrap; }
 @media (max-width: 389px) { .t-head.duo .blinds { display: none; } }
+
+/* 受け渡し画面の公開情報（場のカード・ポット・直前の動き・収支） */
+.ho-card { display: none; }
+.handoff { gap: 8px; }
+.ho-info { display: flex; flex-direction: column; align-items: center; gap: 8px; width: 100%; max-width: 340px; padding: 12px; border-radius: 14px; background: rgba(0, 0, 0, 0.35); color: #fff; font-weight: 600; margin-top: 6px; }
+.ho-board { display: flex; gap: 4px; }
+.ho-board .ho-slot { width: 34px; height: 48px; border-radius: 6px; border: 1px dashed rgba(255, 255, 255, 0.25); }
+.ho-pot { font-size: 13px; color: rgba(255, 255, 255, 0.85); }
+.ho-pot b { color: var(--gold); }
+.ho-moves { font-size: 13px; line-height: 1.55; width: 100%; text-align: center; }
+.ho-cap { font-size: 11px; color: var(--text-faint); }
+.ho-nets { font-size: 12px; color: rgba(255, 255, 255, 0.75); }
+.ho-btn { margin-top: 10px; }
