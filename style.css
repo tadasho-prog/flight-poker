@@ -201,6 +201,7 @@ button:disabled { opacity: 0.45; cursor: default; }
 }
 .seat.hot, .seat.win { border: 2px solid var(--gold); }
 .seat.folded { opacity: 0.4; }
+.seat.folded.shown { opacity: 0.75; } /* 「手札を表示」中、フォールドした人の手札も読めるように */
 .seat.shown { height: 64px; }
 .s-name { display: flex; align-items: center; gap: 3px; font-size: 11px; font-weight: 700; line-height: 14px; white-space: nowrap; }
 .d-btn { width: 14px; height: 14px; border-radius: 7px; background: #fff; color: #111; font-size: 9px; font-weight: 900; display: inline-flex; align-items: center; justify-content: center; flex: none; }

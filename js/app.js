@@ -16,7 +16,7 @@ import {
   describeMove, movesSince,
 } from './duo.js';
 
-const APP_VERSION = 'ver.3.4（2026-11-23 フォールド後の受け渡しを省略）';
+const APP_VERSION = 'ver.3.5（2026-11-25 結果の画面で2人の手札を表示）';
 const SETUP_KEY = 'flightpoker.setup.v1';
 const CPU_MIN = 2;
 const CPU_MAX = 9;
@@ -274,17 +274,20 @@ function renderTable() {
     const L = layout[k];
     const showHand = shown.get(p.id);
     const won = result && (result.totalPayouts[p.id] ?? 0) > 0;
-    const open = !result && !p.folded && p.holeCards.length && canSeeCards(s, p.id); // 「手札を表示」中のもう1人
+    // 「手札を表示」中のもう1人（結果の画面でも、フォールドしていても表にする。要件 M-7）
+    const open = !showHand && p.holeCards.length === 2 && canSeeCards(s, p.id);
     let cardsHtml;
     if (showHand) cardsHtml = `<div class="s-cards up">${showHand.holeCards.map((c) => pcard(c, 18, isHl(c))).join('')}</div>`;
+    else if (open) cardsHtml = `<div class="s-cards up">${p.holeCards.map((c) => pcard(c, 18, !!result && isHl(c))).join('')}</div>`;
     else if (p.folded) cardsHtml = '<div class="s-cards fold">フォールド</div>';
-    else if (open) cardsHtml = `<div class="s-cards up">${p.holeCards.map((c) => pcard(c, 18)).join('')}</div>`;
     else if (p.holeCards.length) cardsHtml = `<div class="s-cards">${pcard(null, 15)}${pcard(null, 15)}</div>`;
     else cardsHtml = '<div class="s-cards"></div>';
 
     let badge = '';
     if (showHand) {
       badge = `<div class="s-badge ${won ? 'win' : 'hand'}">${showHand.value.name}</div>`;
+    } else if (open && p.folded) {
+      badge = '<div class="s-badge hand">フォールド</div>';
     } else {
       const b = actionBadge(p, i);
       if (b) badge = `<div class="s-badge ${b.cls}${b.key ? popAttr(p.id, b.key) : ''}">${b.text}</div>`;
